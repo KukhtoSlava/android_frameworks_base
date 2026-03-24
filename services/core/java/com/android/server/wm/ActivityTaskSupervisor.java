@@ -347,6 +347,15 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
     final ArrayList<ActivityRecord> mNoAnimActivities = new ArrayList<>();
 
     /**
+     * Tasks whose lock task mode start has been deferred because the display still has an active
+     * fixed-rotation launching app. The viewport commit to InputFlinger has not yet happened, so
+     * starting lock task mode immediately would race with the viewport update and leave touch
+     * coordinates stuck at the previous rotation. Flushed in {@link #onFixedRotationFinished}.
+     */
+    @GuardedBy("mService.mGlobalLock")
+    private final ArrayList<Task> mPendingLockTaskModeStart = new ArrayList<>();
+
+    /**
      * Cached value of the topmost resumed activity in the system. Updated when new activity is
      * resumed.
      */
@@ -912,29 +921,15 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
                             && lockTaskController.getLockTaskModeState()
                     == LOCK_TASK_MODE_LOCKED)) {
 
-                if (DesktopExperienceFlags.ENABLE_DESKTOP_WINDOWING_ENTERPRISE_BUGFIX.isTrue()
-                        && task.mTransitionController.isShellTransitionsEnabled()) {
-                    final Transition transition = new Transition(TRANSIT_START_LOCK_TASK_MODE,
-                            0 /* flags */,
-                            task.mTransitionController, mWindowManager.mSyncEngine);
-                    task.mTransitionController.startCollectOrQueue(transition,
-                            (deferred) -> {
-                                final ActionChain chain = mService.mChainTracker.start(
-                                        "realStartActivity",
-                                        transition);
-                                task.mTransitionController.requestStartTransition(transition, task,
-                                        null /* remoteTransition */, null /* displayChange */);
-                                chain.collect(task);
-                                // When starting lock task mode the root task must be in front and
-                                // focused
-                                lockTaskController.startLockTaskMode(task, false,
-                                        0 /* blank UID */);
-                                transition.setReady(task, true);
-                                mService.mChainTracker.end();
-                            });
+                // If the display still has an active fixed-rotation launching app, InputFlinger's
+                // viewport has not been committed for the new rotation yet. Starting lock task
+                // mode here would race with that viewport update and leave touch coordinates
+                // mapped to the wrong rotation. Defer until fixed rotation finishes.
+                final DisplayContent lockTaskDc = task.getDisplayContent();
+                if (lockTaskDc != null && lockTaskDc.hasTopFixedRotationLaunchingApp()) {
+                    mPendingLockTaskModeStart.add(task);
                 } else {
-                    lockTaskController.startLockTaskMode(task, false,
-                            0 /* blank UID */);
+                    startLockTaskModeIfNeeded(task, lockTaskController);
                 }
             }
 
@@ -1003,6 +998,56 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
         }
 
         return true;
+    }
+
+    /**
+     * Starts lock task mode for the given task using the appropriate transition mechanism.
+     * Extracted so the same logic can be used both from the launch path and from the deferred
+     * path that waits for fixed rotation to finish.
+     */
+    private void startLockTaskModeIfNeeded(Task task, LockTaskController lockTaskController) {
+        if (DesktopExperienceFlags.ENABLE_DESKTOP_WINDOWING_ENTERPRISE_BUGFIX.isTrue()
+                && task.mTransitionController.isShellTransitionsEnabled()) {
+            final Transition transition = new Transition(TRANSIT_START_LOCK_TASK_MODE,
+                    0 /* flags */,
+                    task.mTransitionController, mWindowManager.mSyncEngine);
+            task.mTransitionController.startCollectOrQueue(transition,
+                    (deferred) -> {
+                        final ActionChain chain = mService.mChainTracker.start(
+                                "realStartActivity",
+                                transition);
+                        task.mTransitionController.requestStartTransition(transition, task,
+                                null /* remoteTransition */, null /* displayChange */);
+                        chain.collect(task);
+                        // When starting lock task mode the root task must be in front and focused.
+                        lockTaskController.startLockTaskMode(task, false, 0 /* blank UID */);
+                        transition.setReady(task, true);
+                        mService.mChainTracker.end();
+                    });
+        } else {
+            lockTaskController.startLockTaskMode(task, false, 0 /* blank UID */);
+        }
+    }
+
+    /**
+     * Called by {@link DisplayContent} when a fixed-rotation launching app finishes its transform.
+     * At this point the display viewport has been (or is about to be) committed to InputFlinger,
+     * so it is safe to start any lock task mode activations that were deferred to avoid a race
+     * between the viewport update and the lock task transition.
+     */
+    void onFixedRotationFinished(DisplayContent dc) {
+        if (mPendingLockTaskModeStart.isEmpty()) return;
+        final LockTaskController lockTaskController = mService.getLockTaskController();
+        for (int i = mPendingLockTaskModeStart.size() - 1; i >= 0; i--) {
+            final Task task = mPendingLockTaskModeStart.get(i);
+            if (task.getDisplayContent() == dc) {
+                mPendingLockTaskModeStart.remove(i);
+                // Only proceed if the task is still attached to the hierarchy.
+                if (task.isAttached()) {
+                    startLockTaskModeIfNeeded(task, lockTaskController);
+                }
+            }
+        }
     }
 
     /** @return {@link RemoteException} if the app process failed to handle the activity start. */

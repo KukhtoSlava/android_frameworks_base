@@ -2086,6 +2086,11 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
             if (!mTransitionController.hasCollectingRotationChange(this, getRotation())) {
                 finishAsyncRotationIfPossible();
             }
+            // Notify the task supervisor so it can flush any lock task mode starts that were
+            // deferred waiting for this display's fixed rotation to complete. The viewport
+            // commit to InputFlinger happens as part of the rotation traversal that follows,
+            // and starting lock task mode before that would race with the viewport update.
+            mAtmService.mTaskSupervisor.onFixedRotationFinished(this);
         }
         mFixedRotationLaunchingApp = r;
     }
