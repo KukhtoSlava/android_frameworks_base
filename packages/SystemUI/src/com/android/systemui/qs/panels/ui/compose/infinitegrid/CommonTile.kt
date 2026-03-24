@@ -422,7 +422,7 @@ object CommonTileDefaults {
     val TileEndPadding = 12.dp
     val TileDualTargetEndPadding = 8.dp
     val TileArrangementPadding = 6.dp
-    val InactiveCornerRadius = 24.dp
+    val InactiveCornerRadius = 50.dp
     val TileLabelBlurWidth = 32.dp
     const val TILE_MARQUEE_ITERATIONS = 1
     const val TILE_INITIAL_DELAY_MILLIS = 2000
